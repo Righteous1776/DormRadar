@@ -1,0 +1,45 @@
+name: DormRadar
+
+options:
+  bundleIdPrefix: com.righteous1776
+  deploymentTarget:
+    iOS: "26.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+
+targets:
+  DormRadar:
+    type: application
+    platform: iOS
+    sources:
+      - path: DormRadar
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.righteous1776.DormRadar
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: DormRadar uses Bluetooth to show anonymous nearby BLE activity.
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+
+  DormRadarTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: DormRadarTests
+    dependencies:
+      - target: DormRadar
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  DormRadar:
+    build:
+      targets:
+        DormRadar: all
+    test:
+      targets:
+        - DormRadarTests
