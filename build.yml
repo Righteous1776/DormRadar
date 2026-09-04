@@ -1,0 +1,73 @@
+name: Build DormRadar
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import source package once
+        run: |
+          if [ -f DormRadar_iPhone_Source.zip ]; then
+            unzip -o DormRadar_iPhone_Source.zip
+            rm DormRadar_iPhone_Source.zip
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add -A
+            git commit -m "Import DormRadar V1.3 source [skip ci]"
+            git push
+          fi
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Compile app and tests
+        run: |
+          xcodebuild \
+            -project DormRadar.xcodeproj \
+            -scheme DormRadar \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/simulator-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            build-for-testing
+
+      - name: Build unsigned device app
+        run: |
+          xcodebuild \
+            -project DormRadar.xcodeproj \
+            -scheme DormRadar \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/device-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$RUNNER_TEMP/device-build/Build/Products/Release-iphoneos/DormRadar.app" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -qry DormRadar-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DormRadar-V1.3-unsigned
+          path: ${{ runner.temp }}/DormRadar-unsigned.ipa
+          retention-days: 14
