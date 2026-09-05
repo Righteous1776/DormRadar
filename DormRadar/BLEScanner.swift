@@ -29,20 +29,32 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
     @Published private(set) var isSystemLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
     @Published private(set) var isThermallyLimited = thermalLimitIsActive()
     @Published private(set) var userSettings = UserSettings.defaults
+    @Published private(set) var bookmarks: [DeviceBookmark] = []
+    @Published private(set) var lastAlert: ProximityAlert?
 
     let observations: AsyncStream<BLEObservation>
+    let motion = MotionMonitor()
 
     private var continuation: AsyncStream<BLEObservation>.Continuation
     private var central: CBCentralManager!
     private let registry = BLESourceRegistry()
+    private let alertCoordinator = AlertCoordinator()
     private var callbackTimes: [Date] = []
     private var maintenanceTimer: Timer?
     private var dutyTask: Task<Void, Never>?
     private var lastPublish = Date.distantPast
+    private var alertDismissTask: Task<Void, Never>?
+    private var restoredBySystem = false
+    private var bookmarkBySystemID: [UUID: Int] = [:]
+    private var bookmarkBySignature: [String: Int] = [:]
 
-    private var profile: ScanProfile {
-        TuningConfig.profile(settings: userSettings, forcedEco: conservationForced)
+    private enum StorageKey {
+        static let settings = "userSettings"
+        static let bookmarks = "deviceBookmarks.v1"
+        static let monitoringDesired = "monitoringDesired"
     }
+
+    private var profile = TuningConfig.profile(settings: .defaults, forcedEco: false)
 
     var conservationForced: Bool {
         (userSettings.automaticLowPower && isSystemLowPowerMode) ||
@@ -65,13 +77,30 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         let channel = AsyncStream<BLEObservation>.makeStream(bufferingPolicy: .bufferingNewest(256))
         observations = channel.stream
         continuation = channel.continuation
-        if let data = UserDefaults.standard.data(forKey: "userSettings"),
+        if let data = UserDefaults.standard.data(forKey: StorageKey.settings),
            var saved = try? JSONDecoder().decode(UserSettings.self, from: data) {
             saved.normalize()
             userSettings = saved
         }
+        if let data = UserDefaults.standard.data(forKey: StorageKey.bookmarks),
+           let saved = try? JSONDecoder().decode([DeviceBookmark].self, from: data) {
+            bookmarks = saved.map {
+                var item = $0
+                item.normalize()
+                return item
+            }
+        }
         super.init()
-        central = CBCentralManager(delegate: self, queue: .main)
+        rebuildBookmarkIndex()
+        refreshProfile()
+        central = CBCentralManager(delegate: self, queue: .main, options: [
+            CBCentralManagerOptionRestoreIdentifierKey: "com.righteous1776.DormRadar.central",
+            CBCentralManagerOptionShowPowerAlertKey: true
+        ])
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidEnterBackground),
+                                               name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive),
+                                               name: UIApplication.didBecomeActiveNotification, object: nil)
         let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) {
             [weak self] _ in
             Task { @MainActor [weak self] in self?.maintain() }
@@ -80,7 +109,11 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         maintenanceTimer = timer
     }
 
-    deinit { continuation.finish() }
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        alertDismissTask?.cancel()
+        continuation.finish()
+    }
 
     func toggle() {
         if userSettings.hapticsEnabled { Haptics.tap(isRunning ? .light : .medium) }
@@ -93,26 +126,37 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
     }
 
     func updateSetting<Value>(_ keyPath: WritableKeyPath<UserSettings, Value>, to value: Value) {
-        let previousProfile = profile
         var next = userSettings
         next[keyPath: keyPath] = value
         next.normalize()
         guard next != userSettings else { return }
         userSettings = next
         if let data = try? JSONEncoder().encode(next) {
-            UserDefaults.standard.set(data, forKey: "userSettings")
+            UserDefaults.standard.set(data, forKey: StorageKey.settings)
         }
-        if isRunning, previousProfile != profile { activateProfile() }
+        if !next.backgroundMonitoringEnabled {
+            UserDefaults.standard.set(false, forKey: StorageKey.monitoringDesired)
+        } else if isRunning {
+            UserDefaults.standard.set(true, forKey: StorageKey.monitoringDesired)
+        }
+        let profileChanged = refreshProfile()
+        if isRunning, profileChanged { activateProfile() }
     }
 
     func resetSettings() {
         userSettings = .defaults
-        UserDefaults.standard.removeObject(forKey: "userSettings")
+        UserDefaults.standard.removeObject(forKey: StorageKey.settings)
+        if isRunning { UserDefaults.standard.set(true, forKey: StorageKey.monitoringDesired) }
+        let profileChanged = refreshProfile()
         if userSettings.hapticsEnabled { Haptics.tap(.medium) }
-        if isRunning { activateProfile() }
+        if isRunning, profileChanged { activateProfile() }
     }
 
     func start() {
+        beginSession(persistIntent: true)
+    }
+
+    private func beginSession(persistIntent: Bool) {
         guard !isRunning else { return }
         registry.reset()
         callbackTimes.removeAll(keepingCapacity: true)
@@ -121,7 +165,12 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         lastPublish = .distantPast
         isSystemLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
         isThermallyLimited = thermalLimitIsActive()
+        refreshProfile()
         isRunning = true
+        if persistIntent && userSettings.backgroundMonitoringEnabled {
+            UserDefaults.standard.set(true, forKey: StorageKey.monitoringDesired)
+        }
+        motion.start(updateInterval: motionUpdateInterval)
         activateProfile()
     }
 
@@ -130,8 +179,10 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         dutyTask?.cancel()
         dutyTask = nil
         central.stopScan()
+        motion.stop()
         isActivelyScanning = false
         callbacksPerSecond = 0
+        UserDefaults.standard.set(false, forKey: StorageKey.monitoringDesired)
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -144,12 +195,27 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         case .unknown: bluetoothState = "等待蓝牙"
         @unknown default: bluetoothState = "蓝牙状态未知"
         }
-        if central.state == .poweredOn, isRunning { activateProfile() }
+        if central.state == .poweredOn {
+            let shouldResume = restoredBySystem ||
+                (userSettings.backgroundMonitoringEnabled &&
+                 UserDefaults.standard.bool(forKey: StorageKey.monitoringDesired))
+            restoredBySystem = false
+            if shouldResume && !isRunning {
+                beginSession(persistIntent: false)
+            } else if isRunning {
+                activateProfile()
+            }
+        }
         if central.state != .poweredOn {
             dutyTask?.cancel()
             central.stopScan()
             isActivelyScanning = false
         }
+    }
+
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        restoredBySystem = userSettings.backgroundMonitoringEnabled
+        bluetoothState = "正在恢复后台监测"
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
@@ -159,10 +225,21 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         let sample = BLEObservation(systemID: peripheral.identifier, timestamp: .now,
             rssi: value,
             txPower: (advertisementData[CBAdvertisementDataTxPowerLevelKey] as? NSNumber)?.intValue,
-            isConnectable: (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue)
+            isConnectable: (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue,
+            localName: advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+            manufacturerID: Self.manufacturerID(from: advertisementData),
+            serviceUUIDs: Self.serviceUUIDs(from: advertisementData),
+            motionAvailable: motion.isAvailable,
+            receiverMoving: motion.isMoving,
+            relativeYawDegrees: motion.relativeYawDegrees)
         continuation.yield(sample)
-        registry.ingest(sample, filter: TuningConfig.filter(userSettings.filterStrength))
+        let source = registry.ingest(sample, filter: TuningConfig.filter(userSettings.filterStrength))
         registry.trim(to: profile.maxSources)
+        if let bookmark = resolveBookmark(for: source),
+           let alert = alertCoordinator.evaluate(source: source, bookmark: bookmark,
+                                                 settings: userSettings) {
+            show(alert)
+        }
         callbackTimes.append(sample.timestamp)
         if callbackTimes.count > 2048 { callbackTimes.removeFirst(1024) }
         if sample.timestamp.timeIntervalSince(lastPublish) >= profile.refreshInterval {
@@ -170,10 +247,113 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         }
     }
 
+    func bookmark(for source: BLESource) -> DeviceBookmark? {
+        if let index = bookmarkBySystemID[source.systemID] { return bookmarks[index] }
+        guard let signature = source.persistentSignature else { return nil }
+        return bookmarkBySignature[signature].map { bookmarks[$0] }
+    }
+
+    func draftBookmark(for source: BLESource) -> DeviceBookmark {
+        bookmark(for: source) ?? DeviceBookmark(systemID: source.systemID,
+            fallbackSignature: source.persistentSignature,
+            serviceUUIDs: source.serviceUUIDs,
+            customName: source.primaryName == source.displayName ? "" : source.primaryName)
+    }
+
+    func saveBookmark(_ bookmark: DeviceBookmark) {
+        var normalized = bookmark
+        normalized.normalize()
+        normalized.updatedAt = .now
+        if let index = bookmarks.firstIndex(where: { $0.id == normalized.id }) {
+            bookmarks[index] = normalized
+        } else {
+            bookmarks.append(normalized)
+        }
+        rebuildBookmarkIndex()
+        persistBookmarks()
+        if normalized.alertEnabled { alertCoordinator.requestPermissionIfNeeded() }
+        if userSettings.hapticsEnabled { Haptics.tap(.medium) }
+    }
+
+    func removeBookmark(_ bookmark: DeviceBookmark) {
+        bookmarks.removeAll { $0.id == bookmark.id }
+        rebuildBookmarkIndex()
+        alertCoordinator.remove(bookmarkID: bookmark.id)
+        persistBookmarks()
+        if userSettings.hapticsEnabled { Haptics.tap(.light) }
+    }
+
+    func displayName(for source: BLESource) -> String {
+        guard let name = bookmark(for: source)?.customName, !name.isEmpty else { return source.primaryName }
+        return name
+    }
+
+    func dismissAlert() {
+        alertDismissTask?.cancel()
+        lastAlert = nil
+    }
+
+    private func resolveBookmark(for source: BLESource) -> DeviceBookmark? {
+        if let index = bookmarkBySystemID[source.systemID] { return bookmarks[index] }
+        guard let signature = source.persistentSignature,
+              let index = bookmarkBySignature[signature] else { return nil }
+        bookmarks[index].systemID = source.systemID
+        bookmarks[index].updatedAt = .now
+        rebuildBookmarkIndex()
+        persistBookmarks()
+        return bookmarks[index]
+    }
+
+    private func rebuildBookmarkIndex() {
+        bookmarkBySystemID.removeAll(keepingCapacity: true)
+        bookmarkBySignature.removeAll(keepingCapacity: true)
+        for (index, bookmark) in bookmarks.enumerated() {
+            bookmarkBySystemID[bookmark.systemID] = index
+            if let signature = bookmark.fallbackSignature { bookmarkBySignature[signature] = index }
+        }
+    }
+
+    private func persistBookmarks() {
+        if let data = try? JSONEncoder().encode(bookmarks) {
+            UserDefaults.standard.set(data, forKey: StorageKey.bookmarks)
+        }
+    }
+
+    private func show(_ alert: ProximityAlert) {
+        lastAlert = alert
+        alertDismissTask?.cancel()
+        alertDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.lastAlert = nil
+        }
+    }
+
+    @objc private func appDidEnterBackground() {
+        guard isRunning else { return }
+        dutyTask?.cancel()
+        dutyTask = nil
+        motion.stop()
+        guard userSettings.backgroundMonitoringEnabled,
+              central.state == .poweredOn else {
+            central.stopScan()
+            isActivelyScanning = false
+            return
+        }
+        beginHardwareScan(duplicates: false, preferMarkedServices: true)
+    }
+
+    @objc private func appDidBecomeActive() {
+        guard isRunning else { return }
+        motion.start(updateInterval: motionUpdateInterval)
+        activateProfile()
+    }
+
     private func activateProfile() {
         dutyTask?.cancel()
         central.stopScan()
         isActivelyScanning = false
+        motion.configure(updateInterval: motionUpdateInterval)
         guard isRunning, central.state == .poweredOn else { return }
         guard let scan = profile.scanSeconds, let pause = profile.pauseSeconds else {
             beginHardwareScan(duplicates: profile.duplicates)
@@ -191,10 +371,41 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         }
     }
 
-    private func beginHardwareScan(duplicates: Bool) {
-        central.scanForPeripherals(withServices: nil,
+    private func beginHardwareScan(duplicates: Bool, preferMarkedServices: Bool = false) {
+        let markedServices = bookmarks.filter(\.alertEnabled).flatMap(\.serviceUUIDs)
+        let services = preferMarkedServices && !markedServices.isEmpty
+            ? Array(Set(markedServices)).map(CBUUID.init(string:)) : nil
+        central.scanForPeripherals(withServices: services,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: duplicates])
         isActivelyScanning = true
+    }
+
+    private static func manufacturerID(from advertisementData: [String: Any]) -> UInt16? {
+        guard let data = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+              data.count >= 2 else { return nil }
+        let start = data.startIndex
+        return UInt16(data[start]) | (UInt16(data[data.index(after: start)]) << 8)
+    }
+
+    private static func serviceUUIDs(from advertisementData: [String: Any]) -> [String] {
+        var values = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        values += (advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID]) ?? []
+        if let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data] {
+            values.append(contentsOf: serviceData.keys)
+        }
+        return Array(Set(values.map { $0.uuidString.uppercased() })).sorted().prefix(8).map { $0 }
+    }
+
+    @discardableResult
+    private func refreshProfile() -> Bool {
+        let next = TuningConfig.profile(settings: userSettings, forcedEco: conservationForced)
+        guard next != profile else { return false }
+        profile = next
+        return true
+    }
+
+    private var motionUpdateInterval: TimeInterval {
+        isUsingUltraEco ? 0.25 : 0.10
     }
 
     private func maintain() {
@@ -203,7 +414,8 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         if lowPower != isSystemLowPowerMode || thermal != isThermallyLimited {
             isSystemLowPowerMode = lowPower
             isThermallyLimited = thermal
-            if isRunning { activateProfile() }
+            let profileChanged = refreshProfile()
+            if isRunning, profileChanged { activateProfile() }
         }
         guard isRunning else { return }
         let now = Date()
