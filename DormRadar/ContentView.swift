@@ -12,6 +12,7 @@ private enum ActiveSheet: Identifiable {
     }
 }
 
+@MainActor
 struct ContentView: View {
     @StateObject private var scanner = BLEScanner()
     @State private var activeSheet: ActiveSheet?
@@ -354,6 +355,7 @@ private extension View {
     }
 }
 
+@MainActor
 struct ContentView_Previews: PreviewProvider {
     static var previews: some View { ContentView() }
 }

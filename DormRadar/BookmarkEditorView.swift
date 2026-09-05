@@ -1,5 +1,6 @@
 import SwiftUI
 
+@MainActor
 struct BookmarkEditorView: View {
     @ObservedObject var scanner: BLEScanner
     let source: BLESource

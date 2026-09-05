@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 
+@MainActor
 struct SettingsView: View {
     @ObservedObject var scanner: BLEScanner
     @Environment(\.presentationMode) private var presentationMode

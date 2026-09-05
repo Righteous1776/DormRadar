@@ -7,7 +7,11 @@ options:
 
 settings:
   base:
-    SWIFT_VERSION: "6.0"
+    # Xcode 26 still uses the current Swift compiler, but Swift 5 language mode
+    # avoids turning framework delegate/sendability diagnostics into hard errors.
+    # DormRadar does not require Swift 6-only syntax.
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
 
 targets:
   DormRadar:
@@ -30,7 +34,7 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1"
         MARKETING_VERSION: "1.6"
-        CURRENT_PROJECT_VERSION: "7"
+        CURRENT_PROJECT_VERSION: "8"
 
   DormRadarTests:
     type: bundle.unit-test

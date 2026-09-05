@@ -373,8 +373,9 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
 
     private func beginHardwareScan(duplicates: Bool, preferMarkedServices: Bool = false) {
         let markedServices = bookmarks.filter(\.alertEnabled).flatMap(\.serviceUUIDs)
-        let services = preferMarkedServices && !markedServices.isEmpty
-            ? Array(Set(markedServices)).map(CBUUID.init(string:)) : nil
+        let services: [CBUUID]? = preferMarkedServices && !markedServices.isEmpty
+            ? Array(Set(markedServices)).map { CBUUID(string: $0) }
+            : nil
         central.scanForPeripherals(withServices: services,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: duplicates])
         isActivelyScanning = true

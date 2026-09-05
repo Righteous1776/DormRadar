@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 
+@MainActor
 struct DeviceDetailView: View {
     @ObservedObject var scanner: BLEScanner
     let source: BLESource
