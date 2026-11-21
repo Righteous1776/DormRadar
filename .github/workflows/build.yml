@@ -3,6 +3,8 @@ name: Build DormRadar
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -17,6 +19,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Import source package once
+        if: github.event_name != 'pull_request'
         run: |
           if [ -f DormRadar_iPhone_Source.zip ]; then
             unzip -o DormRadar_iPhone_Source.zip
@@ -45,6 +48,22 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build-for-testing
 
+      - name: Run simulator tests
+        run: |
+          destination="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(d["udid"] for runtime, entries in reversed(sorted(devices.items()))
+                     if "iOS" in runtime for d in entries if d["name"].startswith("iPhone")))
+          ')"
+          xcodebuild \
+            -project DormRadar.xcodeproj \
+            -scheme DormRadar \
+            -destination "platform=iOS Simulator,id=$destination" \
+            -derivedDataPath "$RUNNER_TEMP/simulator-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            test-without-building
+
       - name: Build unsigned device app
         run: |
           xcodebuild \
@@ -59,15 +78,19 @@ jobs:
             build
 
       - name: Package unsigned IPA
+        id: ipa
         run: |
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -R "$RUNNER_TEMP/device-build/Build/Products/Release-iphoneos/DormRadar.app" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP"
           zip -qry DormRadar-unsigned.ipa Payload
+          version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Payload/DormRadar.app/Info.plist)
+          build=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' Payload/DormRadar.app/Info.plist)
+          echo "artifact_name=DormRadar-V${version}-Build${build}-unsigned" >> "$GITHUB_OUTPUT"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: DormRadar-V1.3-unsigned
+          name: ${{ steps.ipa.outputs.artifact_name }}
           path: ${{ runner.temp }}/DormRadar-unsigned.ipa
           retention-days: 14

@@ -201,12 +201,94 @@ final class BLESourceRegistryTests: XCTestCase {
         XCTAssertFalse(bookmark.soundEnabled)
     }
 
-    func testNamedSourceCreatesFallbackSignature() {
-        let observation = BLEObservation(systemID: UUID(), timestamp: Date(), rssi: -60,
-            txPower: nil, isConnectable: nil, localName: "Desk Tag", manufacturerID: 0x004C,
-            serviceUUIDs: ["180F"], motionAvailable: false, receiverMoving: false,
-            relativeYawDegrees: nil)
-        let source = BLESourceRegistry().ingest(observation)
-        XCTAssertNotNil(source.persistentSignature)
+    func testCatalogNamesAndModelEvidence() throws {
+        let catalog = DeviceCatalog.bundled
+        XCTAssertEqual(catalog.companyName(0x004C), "Apple")
+        XCTAssertEqual(catalog.companyName(0x0001), "Nokia Mobile Phones")
+        XCTAssertEqual(catalog.serviceName("0000180F-0000-1000-8000-00805f9b34fb"), "Battery Service")
+
+        let payload = Data([0x00, 0x20, 0x5B, 0x05, 0x01])
+        let model = try XCTUnwrap(catalog.model(miBeaconPayload: payload, broadcastName: nil))
+        XCTAssertTrue(model.name.contains("LYWSD03MMC"))
+        XCTAssertNil(catalog.model(miBeaconPayload: Data(payload.prefix(4)), broadcastName: nil))
+        XCTAssertNil(catalog.model(miBeaconPayload: Data([0x10, 0x20, 0x5B, 0x05, 0x01]),
+                                   broadcastName: nil))
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: "Govee_H5074_01")?.name,
+                       "Govee H5074")
+        XCTAssertNil(catalog.model(miBeaconPayload: nil, broadcastName: "Govee_H0000"))
+
+        var headphones = Data([0x4C, 0x00, 0x07, 0x19, 0x01, 0x24, 0x20])
+        headphones.append(Data(repeating: 0, count: 22))
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: nil,
+                                     manufacturerData: headphones)?.name, "AirPods Pro（第 2 代，USB-C）")
+        headphones[2] = 0x10
+        XCTAssertNil(catalog.model(miBeaconPayload: nil, broadcastName: nil, manufacturerData: headphones))
+    }
+
+    func testHardwareCodesRequireAnExactName() {
+        let catalog = DeviceCatalog.bundled
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: "SAMSUNG-SM-S938B")?.name,
+                       "Galaxy S25 Ultra")
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: "24031PN0DC")?.name,
+                       "Xiaomi 14 Ultra")
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: "CPH2581")?.name,
+                       "OnePlus 12")
+        XCTAssertNil(catalog.model(miBeaconPayload: nil, broadcastName: "Zeo SM-S938B"))
+        XCTAssertNil(catalog.model(miBeaconPayload: nil, broadcastName: "SM-S938"))
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: "iPhone14,2")?.name,
+                       "iPhone 13 Pro")
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: nil,
+                                     systemName: "Watch7,8")?.strength, .systemName)
+    }
+
+    func testSwitchBotAndShellyServiceEvidence() {
+        let catalog = DeviceCatalog.bundled
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: nil,
+                                     switchBotPayload: Data([0xFB, 0x00]))?.name, "SwitchBot Curtain 3")
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: nil,
+                                     switchBotPayload: Data([0, 0, 1, 16, 83, 176, 2]))?.name,
+                       "SwitchBot Weather Station")
+        XCTAssertNil(catalog.model(miBeaconPayload: nil, broadcastName: nil,
+                                   switchBotPayload: Data([0xFB])))
+        XCTAssertEqual(catalog.model(miBeaconPayload: nil, broadcastName: "SBBT-002C",
+                                     hasBTHome: true)?.name, "Shelly BLU Button1")
+        XCTAssertNil(catalog.model(miBeaconPayload: nil, broadcastName: "SBBT-002C"))
+    }
+
+    func testRegistryPreservesStrongerModelEvidence() {
+        let registry = BLESourceRegistry()
+        let device = UUID()
+        let now = Date()
+        var first = sample(device, now, -60)
+        first.model = AdvertisedModel(name: "SwitchBot Curtain 3", evidence: "service data")
+        _ = registry.ingest(first)
+        var second = sample(device, now.addingTimeInterval(1), -59)
+        second.model = AdvertisedModel(name: "Galaxy S25 Ultra", evidence: "broadcast name",
+                                       strength: .broadcastName)
+        XCTAssertEqual(registry.ingest(second).model, first.model)
+    }
+
+    func testSQLiteBookmarkMigrationAndReopen() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("marks.sqlite3")
+        let original = DeviceBookmark(systemID: UUID(), fallbackSignature: "same model",
+                                      customName: "桌上的耳机", alertEnabled: true)
+        let other = DeviceBookmark(systemID: UUID(), fallbackSignature: "same model",
+                                   customName: "包里的耳机")
+        var changed = original
+        changed.customName = "已重命名"
+        do {
+            let store = try BookmarkStore(url: url)
+            try store.migrateLegacy([original, other])
+            try store.save(changed)
+            try store.migrateLegacy([original, other])
+        }
+        let reopened = try BookmarkStore(url: url)
+        XCTAssertEqual(Set(try reopened.loadBookmarks().map { $0.id }), [original.id, other.id])
+        XCTAssertEqual(try reopened.loadBookmarks().first { $0.id == original.id }, changed)
+        try reopened.remove(id: other.id)
+        XCTAssertEqual(try reopened.loadBookmarks(), [changed])
     }
 }

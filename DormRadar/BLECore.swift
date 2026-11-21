@@ -197,6 +197,8 @@ struct BLEObservation: Sendable {
     let motionAvailable: Bool
     let receiverMoving: Bool
     let relativeYawDegrees: Double?
+    var systemName: String? = nil
+    var model: AdvertisedModel? = nil
 }
 
 struct BLESource: Identifiable, Sendable, Equatable {
@@ -220,23 +222,30 @@ struct BLESource: Identifiable, Sendable, Equatable {
     var movingSampleCount: Int
     var orientationRSSI: [Double]
     var orientationSampleCounts: [Int]
+    var systemName: String? = nil
+    var model: AdvertisedModel? = nil
 
     var displayName: String { "Source \(alias)" }
+    var reportedName: String? { model?.name ?? localName ?? systemName }
     var primaryName: String {
-        guard let name = localName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !name.isEmpty else { return displayName }
-        return String(name.prefix(48))
+        if let reportedName { return reportedName }
+        if let manufacturerID, let company = DeviceCatalog.bundled.companyName(manufacturerID) {
+            return "\(company) · 型号未知"
+        }
+        return "未知 BLE 设备 · \(alias)"
+    }
+    var nameEvidence: String {
+        if let model { return model.evidence }
+        if localName != nil { return "设备广播名称" }
+        if systemName != nil { return "iOS 设备名称" }
+        if let manufacturerID, DeviceCatalog.bundled.companyName(manufacturerID) != nil {
+            return "仅识别到广播厂商"
+        }
+        return "缺少设备名称和型号信息"
     }
     var manufacturerLabel: String {
         guard let id = manufacturerID else { return "未广播厂商编号" }
-        switch id {
-        case 0x004C: return "Apple"
-        case 0x0006: return "Microsoft"
-        case 0x0075: return "Samsung"
-        case 0x00E0: return "Google"
-        case 0x0059: return "Nordic Semiconductor"
-        default: return String(format: "厂商 0x%04X", id)
-        }
+        return DeviceCatalog.bundled.companyName(id) ?? String(format: "厂商 0x%04X", id)
     }
     var deviceTypeLabel: String {
         let name = primaryName.lowercased()
@@ -245,7 +254,7 @@ struct BLESource: Identifiable, Sendable, Equatable {
         if name.contains("keyboard") || serviceUUIDs.contains("1812") { return "可能是输入设备" }
         if serviceUUIDs.contains("180D") { return "可能是心率设备" }
         if manufacturerID == 0x004C { return "Apple 设备或配件" }
-        if localName != nil { return "具名 BLE 设备" }
+        if reportedName != nil { return "具名 BLE 设备" }
         return "匿名 BLE 广播源"
     }
     var stabilityLabel: String {
@@ -312,22 +321,18 @@ struct BLESource: Identifiable, Sendable, Equatable {
         return "相对开始朝向约 +\(degrees)°"
     }
     var serviceLabels: [String] {
-        serviceUUIDs.map {
-            switch $0 {
+        serviceUUIDs.map { raw in
+            let uuid = DeviceCatalog.shortUUID(raw)
+            switch uuid {
             case "180A": return "设备信息 (180A)"
             case "180D": return "心率 (180D)"
             case "180F": return "电池 (180F)"
             case "1812": return "人机接口 (1812)"
             case "FEAA": return "Eddystone 信标 (FEAA)"
             case "FE2C": return "Fast Pair (FE2C)"
-            default: return $0
+            default: return DeviceCatalog.bundled.serviceName(uuid).map { "\($0) (\(uuid))" } ?? uuid
             }
         }
-    }
-    var persistentSignature: String? {
-        guard let name = localName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              !name.isEmpty, manufacturerID != nil || !serviceUUIDs.isEmpty else { return nil }
-        return ([name, manufacturerID.map(String.init) ?? "-"] + serviceUUIDs.sorted()).joined(separator: "|")
     }
 }
 
@@ -371,6 +376,11 @@ final class BLESourceRegistry {
                 source.txPower = sample.txPower ?? source.txPower
                 source.isConnectable = sample.isConnectable ?? source.isConnectable
                 source.localName = sample.localName ?? source.localName
+                source.systemName = sample.systemName ?? source.systemName
+                if let model = sample.model,
+                   source.model.map({ $0.strength.rawValue <= model.strength.rawValue }) ?? true {
+                    source.model = model
+                }
                 source.manufacturerID = sample.manufacturerID ?? source.manufacturerID
                 if !sample.serviceUUIDs.isEmpty { source.serviceUUIDs = sample.serviceUUIDs }
                 if sample.motionAvailable {
@@ -404,7 +414,8 @@ final class BLESourceRegistry {
             stationarySampleCount: sample.motionAvailable && !sample.receiverMoving ? 1 : 0,
             movingSampleCount: sample.motionAvailable && sample.receiverMoving ? 1 : 0,
             orientationRSSI: Array(repeating: -110, count: 12),
-            orientationSampleCounts: Array(repeating: 0, count: 12))
+            orientationSampleCounts: Array(repeating: 0, count: 12),
+            systemName: sample.systemName, model: sample.model)
         nextAlias += 1
         links[sample.systemID] = localID
         records[localID] = source
