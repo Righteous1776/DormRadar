@@ -3,17 +3,32 @@ import SwiftUI
 @MainActor
 struct BookmarkEditorView: View {
     @ObservedObject var scanner: BLEScanner
-    let source: BLESource
+    private let placeholder: String
     @Environment(\.presentationMode) private var presentationMode
     @State private var draft: DeviceBookmark
     private let existedAtOpen: Bool
+    @State private var writeError: String?
 
     init(scanner: BLEScanner, source: BLESource) {
-        self.scanner = scanner
-        self.source = source
         let existing = scanner.bookmark(for: source)
-        _draft = State(initialValue: existing ?? scanner.draftBookmark(for: source))
-        existedAtOpen = existing != nil
+        self.init(scanner: scanner, draft: existing ?? scanner.draftBookmark(for: source),
+                  placeholder: source.reportedName ?? "输入设备名称", exists: existing != nil)
+    }
+
+    init(scanner: BLEScanner, draft: DeviceBookmark, placeholder: String, exists: Bool = true) {
+        self.scanner = scanner
+        self.placeholder = placeholder
+        _draft = State(initialValue: draft)
+        existedAtOpen = exists
+    }
+
+    private func finish(_ change: () throws -> Void) {
+        do {
+            try change()
+            presentationMode.wrappedValue.dismiss()
+        } catch {
+            writeError = "无法写入设备标记，请解锁手机后重试。"
+        }
     }
 
     var body: some View {
@@ -21,8 +36,8 @@ struct BookmarkEditorView: View {
             ZStack {
                 Form {
                 Section(header: Text("标记名称"),
-                        footer: Text("标记保存在本机。下次识别到同一设备时继续显示；请只标记你拥有或获授权管理的设备。")) {
-                    TextField(source.primaryName, text: $draft.customName)
+                        footer: Text("标记保存在本机。再次收到相同的 iOS 设备标识时会显示此标记。")) {
+                    TextField(placeholder, text: $draft.customName)
                         .textInputAutocapitalization(.never)
                 }
 
@@ -63,8 +78,7 @@ struct BookmarkEditorView: View {
                 if existedAtOpen {
                     Section {
                         Button("删除这个标记", role: .destructive) {
-                            scanner.removeBookmark(draft)
-                            presentationMode.wrappedValue.dismiss()
+                            finish { try scanner.removeBookmark(draft) }
                         }
                     }
                 }
@@ -78,11 +92,17 @@ struct BookmarkEditorView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") {
-                        scanner.saveBookmark(draft)
-                        presentationMode.wrappedValue.dismiss()
+                        finish { try scanner.saveBookmark(draft) }
                     }
                 }
             }
+        }
+        .alert("保存标记失败", isPresented: Binding(
+            get: { writeError != nil }, set: { if !$0 { writeError = nil } }
+        )) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(writeError ?? "")
         }
         .navigationViewStyle(StackNavigationViewStyle())
         .preferredColorScheme(.dark)

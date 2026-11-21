@@ -4,7 +4,15 @@ import SwiftUI
 @MainActor
 struct DeviceDetailView: View {
     @ObservedObject var scanner: BLEScanner
-    let source: BLESource
+    let initialSource: BLESource
+    private var source: BLESource {
+        scanner.sources.first { $0.id == initialSource.id } ?? initialSource
+    }
+
+    init(scanner: BLEScanner, source: BLESource) {
+        self.scanner = scanner
+        initialSource = source
+    }
     @Environment(\.presentationMode) private var presentationMode
     @State private var showBookmarkEditor = false
 
@@ -116,7 +124,11 @@ struct DeviceDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("广播信息").font(.headline)
             detailRow("会话编号", source.displayName)
+            detailRow("名称依据", source.nameEvidence)
             detailRow("广播名称", source.localName ?? "未提供")
+            if let systemName = source.systemName, systemName != source.localName {
+                detailRow("iOS 设备名称", systemName)
+            }
             detailRow("厂商", source.manufacturerLabel)
             detailRow("可连接", connectableText)
             detailRow("发射功率", source.txPower.map { "\($0) dBm" } ?? "未提供")

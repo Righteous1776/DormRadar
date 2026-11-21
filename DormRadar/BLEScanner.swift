@@ -30,6 +30,7 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
     @Published private(set) var isThermallyLimited = thermalLimitIsActive()
     @Published private(set) var userSettings = UserSettings.defaults
     @Published private(set) var bookmarks: [DeviceBookmark] = []
+    @Published private(set) var bookmarkStorageUnavailable = false
     @Published private(set) var lastAlert: ProximityAlert?
 
     let observations: AsyncStream<BLEObservation>
@@ -46,7 +47,9 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
     private var alertDismissTask: Task<Void, Never>?
     private var restoredBySystem = false
     private var bookmarkBySystemID: [UUID: Int] = [:]
-    private var bookmarkBySignature: [String: Int] = [:]
+    private var bookmarkStore: BookmarkStore?
+
+    private enum BookmarkError: Error { case storageUnavailable }
 
     private enum StorageKey {
         static let settings = "userSettings"
@@ -91,7 +94,7 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
             }
         }
         super.init()
-        rebuildBookmarkIndex()
+        openBookmarkStore()
         refreshProfile()
         central = CBCentralManager(delegate: self, queue: .main, options: [
             CBCentralManagerOptionRestoreIdentifierKey: "com.righteous1776.DormRadar.central",
@@ -222,20 +225,26 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let value = RSSI.intValue
         guard (-110 ... -20).contains(value), value != 0, value != 127 else { return }
+        let localName = Self.cleanName(advertisementData[CBAdvertisementDataLocalNameKey] as? String)
+        let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]
+        let miBeacon = serviceData?[CBUUID(string: "FE95")]
         let sample = BLEObservation(systemID: peripheral.identifier, timestamp: .now,
             rssi: value,
             txPower: (advertisementData[CBAdvertisementDataTxPowerLevelKey] as? NSNumber)?.intValue,
             isConnectable: (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue,
-            localName: advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+            localName: localName,
             manufacturerID: Self.manufacturerID(from: advertisementData),
             serviceUUIDs: Self.serviceUUIDs(from: advertisementData),
             motionAvailable: motion.isAvailable,
             receiverMoving: motion.isMoving,
-            relativeYawDegrees: motion.relativeYawDegrees)
+            relativeYawDegrees: motion.relativeYawDegrees,
+            systemName: Self.cleanName(peripheral.name),
+            model: DeviceCatalog.bundled.model(miBeaconPayload: miBeacon, broadcastName: localName,
+                manufacturerData: advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data))
         continuation.yield(sample)
         let source = registry.ingest(sample, filter: TuningConfig.filter(userSettings.filterStrength))
         registry.trim(to: profile.maxSources)
-        if let bookmark = resolveBookmark(for: source),
+        if let bookmark = bookmark(for: source),
            let alert = alertCoordinator.evaluate(source: source, bookmark: bookmark,
                                                  settings: userSettings) {
             show(alert)
@@ -248,38 +257,37 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
     }
 
     func bookmark(for source: BLESource) -> DeviceBookmark? {
-        if let index = bookmarkBySystemID[source.systemID] { return bookmarks[index] }
-        guard let signature = source.persistentSignature else { return nil }
-        return bookmarkBySignature[signature].map { bookmarks[$0] }
+        bookmarkBySystemID[source.systemID].map { bookmarks[$0] }
     }
 
     func draftBookmark(for source: BLESource) -> DeviceBookmark {
         bookmark(for: source) ?? DeviceBookmark(systemID: source.systemID,
-            fallbackSignature: source.persistentSignature,
-            serviceUUIDs: source.serviceUUIDs,
-            customName: source.primaryName == source.displayName ? "" : source.primaryName)
+            serviceUUIDs: source.serviceUUIDs, customName: source.reportedName ?? "")
     }
 
-    func saveBookmark(_ bookmark: DeviceBookmark) {
+    func saveBookmark(_ bookmark: DeviceBookmark) throws {
+        guard let bookmarkStore else { throw BookmarkError.storageUnavailable }
         var normalized = bookmark
         normalized.normalize()
         normalized.updatedAt = .now
-        if let index = bookmarks.firstIndex(where: { $0.id == normalized.id }) {
-            bookmarks[index] = normalized
-        } else {
-            bookmarks.append(normalized)
+        if !bookmarks.contains(where: { $0.id == bookmark.id }),
+           let index = bookmarkBySystemID[bookmark.systemID] {
+            normalized.id = bookmarks[index].id
         }
+        try bookmarkStore.save(normalized)
+        bookmarks.removeAll { $0.id == normalized.id }
+        bookmarks.insert(normalized, at: 0)
         rebuildBookmarkIndex()
-        persistBookmarks()
         if normalized.alertEnabled { alertCoordinator.requestPermissionIfNeeded() }
         if userSettings.hapticsEnabled { Haptics.tap(.medium) }
     }
 
-    func removeBookmark(_ bookmark: DeviceBookmark) {
+    func removeBookmark(_ bookmark: DeviceBookmark) throws {
+        guard let bookmarkStore else { throw BookmarkError.storageUnavailable }
+        try bookmarkStore.remove(id: bookmark.id)
         bookmarks.removeAll { $0.id == bookmark.id }
         rebuildBookmarkIndex()
         alertCoordinator.remove(bookmarkID: bookmark.id)
-        persistBookmarks()
         if userSettings.hapticsEnabled { Haptics.tap(.light) }
     }
 
@@ -293,29 +301,28 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         lastAlert = nil
     }
 
-    private func resolveBookmark(for source: BLESource) -> DeviceBookmark? {
-        if let index = bookmarkBySystemID[source.systemID] { return bookmarks[index] }
-        guard let signature = source.persistentSignature,
-              let index = bookmarkBySignature[signature] else { return nil }
-        bookmarks[index].systemID = source.systemID
-        bookmarks[index].updatedAt = .now
+    private func openBookmarkStore() {
+        do {
+            let store = try BookmarkStore.openDefault()
+            let legacyData = UserDefaults.standard.data(forKey: StorageKey.bookmarks)
+            if let legacyData {
+                let legacy = try JSONDecoder().decode([DeviceBookmark].self, from: legacyData)
+                try store.migrateLegacy(legacy)
+            }
+            bookmarks = try store.loadBookmarks()
+            bookmarkStore = store
+            bookmarkStorageUnavailable = false
+            if legacyData != nil { UserDefaults.standard.removeObject(forKey: StorageKey.bookmarks) }
+        } catch {
+            bookmarkStorageUnavailable = true
+        }
         rebuildBookmarkIndex()
-        persistBookmarks()
-        return bookmarks[index]
     }
 
     private func rebuildBookmarkIndex() {
         bookmarkBySystemID.removeAll(keepingCapacity: true)
-        bookmarkBySignature.removeAll(keepingCapacity: true)
-        for (index, bookmark) in bookmarks.enumerated() {
+        for (index, bookmark) in bookmarks.enumerated() where bookmarkBySystemID[bookmark.systemID] == nil {
             bookmarkBySystemID[bookmark.systemID] = index
-            if let signature = bookmark.fallbackSignature { bookmarkBySignature[signature] = index }
-        }
-    }
-
-    private func persistBookmarks() {
-        if let data = try? JSONEncoder().encode(bookmarks) {
-            UserDefaults.standard.set(data, forKey: StorageKey.bookmarks)
         }
     }
 
@@ -344,6 +351,7 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
     }
 
     @objc private func appDidBecomeActive() {
+        if bookmarkStore == nil { openBookmarkStore() }
         guard isRunning else { return }
         motion.start(updateInterval: motionUpdateInterval)
         activateProfile()
@@ -379,6 +387,12 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         central.scanForPeripherals(withServices: services,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: duplicates])
         isActivelyScanning = true
+    }
+
+    private static func cleanName(_ raw: String?) -> String? {
+        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines.union(.controlCharacters)),
+              !value.isEmpty else { return nil }
+        return String(value.prefix(80))
     }
 
     private static func manufacturerID(from advertisementData: [String: Any]) -> UInt16? {

@@ -2,11 +2,13 @@ import SwiftUI
 
 private enum ActiveSheet: Identifiable {
     case settings
+    case bookmarks
     case source(BLESource)
 
     var id: String {
         switch self {
         case .settings: return "settings"
+        case .bookmarks: return "bookmarks"
         case .source(let source): return source.id.uuidString
         }
     }
@@ -55,6 +57,7 @@ struct ContentView: View {
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
             case .settings: SettingsView(scanner: scanner)
+            case .bookmarks: BookmarkListView(scanner: scanner)
             case .source(let source):
                 DeviceDetailView(scanner: scanner, source: source)
             }
@@ -66,7 +69,7 @@ struct ContentView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("DormRadar").font(.system(.title, design: .rounded).weight(.bold))
-                    Text("匿名近场活动监测").font(.caption).foregroundColor(.white.opacity(0.55))
+                    Text("附近蓝牙设备").font(.caption).foregroundColor(.white.opacity(0.55))
                 }
                 Spacer()
                 Button {
@@ -201,6 +204,13 @@ struct ContentView: View {
             HStack {
                 Text("附近信号").font(.headline)
                 Spacer()
+                Button {
+                    activeSheet = .bookmarks
+                } label: {
+                    Label("标记 \(scanner.bookmarks.count)", systemImage: "bookmark")
+                        .font(.caption.weight(.semibold))
+                }
+                .accessibilityLabel("管理设备标记")
                 Text(scanner.activeSourceCount > scanner.sources.count
                      ? "显示前\(scanner.sources.count)个" : "仅本次会话")
                     .font(.caption).foregroundColor(.white.opacity(0.45))
@@ -209,7 +219,7 @@ struct ContentView: View {
                 VStack(spacing: 10) {
                     Image(systemName: "dot.radiowaves.left.and.right")
                         .font(.system(size: 30)).foregroundColor(scanner.userSettings.theme.accent.opacity(0.7))
-                    Text(scanner.isRunning ? "正在等待 BLE 广播" : "开始后显示匿名信号源")
+                    Text(scanner.isRunning ? "正在等待 BLE 广播" : "开始后显示附近蓝牙广播")
                         .font(.subheadline).foregroundColor(.white.opacity(0.55))
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, 34)
@@ -280,6 +290,8 @@ private struct SourceRow: View {
                     Text(displayName).font(.headline).lineLimit(1)
                     if bookmark != nil { Image(systemName: "bookmark.fill").font(.caption2).foregroundColor(bookmark?.color.swiftUIColor) }
                 }
+                Text(source.nameEvidence).lineLimit(1)
+                    .font(.caption2).foregroundColor(.white.opacity(0.55))
                 Text("\(source.sampleCount)个样本 · \(source.ageLabel())")
                     .font(.caption).foregroundColor(.white.opacity(0.5))
             }
