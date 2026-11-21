@@ -24,6 +24,8 @@ targets:
     info:
       path: DormRadar/Info.plist
       properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSBluetoothAlwaysUsageDescription: DormRadar uses Bluetooth to show nearby BLE activity and alerts for devices you mark.
         NSMotionUsageDescription: DormRadar uses motion data to reduce ranging errors while the phone moves.
         UILaunchScreen: {}
