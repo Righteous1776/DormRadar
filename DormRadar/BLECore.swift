@@ -377,7 +377,10 @@ final class BLESourceRegistry {
                 source.isConnectable = sample.isConnectable ?? source.isConnectable
                 source.localName = sample.localName ?? source.localName
                 source.systemName = sample.systemName ?? source.systemName
-                source.model = sample.model ?? source.model
+                if let model = sample.model,
+                   source.model.map({ $0.strength.rawValue <= model.strength.rawValue }) ?? true {
+                    source.model = model
+                }
                 source.manufacturerID = sample.manufacturerID ?? source.manufacturerID
                 if !sample.serviceUUIDs.isEmpty { source.serviceUUIDs = sample.serviceUUIDs }
                 if sample.motionAvailable {

@@ -3,6 +3,17 @@ import Foundation
 struct AdvertisedModel: Equatable, Sendable {
     let name: String
     let evidence: String
+    let strength: Strength
+
+    enum Strength: Int, Sendable {
+        case systemName, broadcastName, productCode
+    }
+
+    init(name: String, evidence: String, strength: Strength = .productCode) {
+        self.name = name
+        self.evidence = evidence
+        self.strength = strength
+    }
 }
 
 struct DeviceCatalog: Decodable, Sendable {
@@ -17,6 +28,22 @@ struct DeviceCatalog: Decodable, Sendable {
     private let miBeacon: [String: Model]
     private let govee: Set<String>
     private let appleHeadphones: [String: String]
+
+    private struct AdditionalCodes: Decodable, Sendable {
+        let android: [String: String]
+        let apple: [String: String]
+        let switchbot: [String: String]
+        let shelly: [String: String]
+
+        static let bundled: AdditionalCodes = {
+            if let url = Bundle.main.url(forResource: "AdditionalModelCodes", withExtension: "json"),
+               let data = try? Data(contentsOf: url),
+               let codes = try? JSONDecoder().decode(AdditionalCodes.self, from: data) {
+                return codes
+            }
+            return AdditionalCodes(android: [:], apple: [:], switchbot: [:], shelly: [:])
+        }()
+    }
 
     static let bundled: DeviceCatalog = {
         if let url = Bundle.main.url(forResource: "DeviceCatalog", withExtension: "json"),
@@ -40,8 +67,9 @@ struct DeviceCatalog: Decodable, Sendable {
 
     func serviceName(_ uuid: String) -> String? { services[Self.shortUUID(uuid)] }
 
-    func model(miBeaconPayload: Data?, broadcastName: String?,
-               manufacturerData: Data? = nil) -> AdvertisedModel? {
+    func model(miBeaconPayload: Data?, broadcastName: String?, manufacturerData: Data? = nil,
+               switchBotPayload: Data? = nil, hasBTHome: Bool = false,
+               systemName: String? = nil) -> AdvertisedModel? {
         if let data = manufacturerData, data.count == 29 {
             let header = Array(data.prefix(7))
             if header.prefix(5).elementsEqual([0x4C, 0x00, 0x07, 0x19, 0x01]) {
@@ -63,7 +91,52 @@ struct DeviceCatalog: Decodable, Sendable {
                                        evidence: "MiBeacon 广播产品编号")
             }
         }
-        guard let name = broadcastName?.uppercased() else { return nil }
+        if let payload = switchBotPayload, let name = switchBotName(payload) {
+            return AdvertisedModel(name: name, evidence: "SwitchBot 服务数据中的产品代码")
+        }
+        if let broadcastName {
+            let name = broadcastName.uppercased()
+            if hasBTHome, let model = AdditionalCodes.bundled.shelly[name] {
+                return AdvertisedModel(name: model, evidence: "BTHome 服务与 Shelly 广播型号",
+                                       strength: .broadcastName)
+            }
+            if let model = namedHardwareModel(name) {
+                return AdvertisedModel(name: model, evidence: "广播名称中的厂商型号代码",
+                                       strength: .broadcastName)
+            }
+            if let model = goveeModel(name) {
+                return AdvertisedModel(name: model, evidence: "Govee 广播名称中的型号",
+                                       strength: .broadcastName)
+            }
+        } else if let systemName, let model = namedHardwareModel(systemName.uppercased()) {
+            return AdvertisedModel(name: model, evidence: "iOS 设备名称中的厂商型号代码",
+                                   strength: .systemName)
+        }
+        return nil
+    }
+
+    private func namedHardwareModel(_ name: String) -> String? {
+        let codes = AdditionalCodes.bundled
+        if let model = codes.apple[name] ?? codes.android[name] { return model }
+        if name.hasPrefix("SAMSUNG-SM-") {
+            return codes.android[String(name.dropFirst("SAMSUNG-".count))]
+        }
+        return nil
+    }
+
+    private func switchBotName(_ payload: Data) -> String? {
+        guard payload.count >= 2, let first = payload.first else { return nil }
+        let codes = AdditionalCodes.bundled.switchbot
+        if let name = codes[String(format: "%02x", first & 0x7F)] { return name }
+        guard payload.count >= 6 else { return nil }
+        for offset in [0, 1] {
+            let code = payload.dropLast(offset).suffix(4).map { String(format: "%02x", $0) }.joined()
+            if let name = codes[code] { return name }
+        }
+        return nil
+    }
+
+    private func goveeModel(_ name: String) -> String? {
         let code: String
         if name.hasPrefix("GOVEE_") || name.hasPrefix("GOVEE ") {
             code = String(name.dropFirst(6).prefix(5))
@@ -73,7 +146,7 @@ struct DeviceCatalog: Decodable, Sendable {
             return nil
         }
         guard govee.contains(code) else { return nil }
-        return AdvertisedModel(name: "Govee \(code)", evidence: "Govee 广播名称中的型号")
+        return "Govee \(code)"
     }
 
     static func shortUUID(_ raw: String) -> String {

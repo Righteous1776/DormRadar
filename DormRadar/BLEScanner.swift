@@ -226,21 +226,31 @@ final class BLEScanner: NSObject, ObservableObject, @preconcurrency CBCentralMan
         let value = RSSI.intValue
         guard (-110 ... -20).contains(value), value != 0, value != 127 else { return }
         let localName = Self.cleanName(advertisementData[CBAdvertisementDataLocalNameKey] as? String)
-        let serviceData = advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]
-        let miBeacon = serviceData?[CBUUID(string: "FE95")]
+        let systemName = Self.cleanName(peripheral.name)
+        let serviceData = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data] ?? [:])
+            .reduce(into: [String: Data]()) { values, pair in
+                let uuid = DeviceCatalog.shortUUID(pair.key.uuidString)
+                // Prefer the nonempty report if the same UUID appears in both encodings.
+                if values[uuid]?.isEmpty != false { values[uuid] = pair.value }
+            }
+        let advertisedServices = Self.serviceUUIDs(from: advertisementData)
+        let switchBotData = serviceData["FD3D"].flatMap { $0.isEmpty ? nil : $0 } ?? serviceData["0D00"]
         let sample = BLEObservation(systemID: peripheral.identifier, timestamp: .now,
             rssi: value,
             txPower: (advertisementData[CBAdvertisementDataTxPowerLevelKey] as? NSNumber)?.intValue,
             isConnectable: (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue,
             localName: localName,
             manufacturerID: Self.manufacturerID(from: advertisementData),
-            serviceUUIDs: Self.serviceUUIDs(from: advertisementData),
+            serviceUUIDs: advertisedServices,
             motionAvailable: motion.isAvailable,
             receiverMoving: motion.isMoving,
             relativeYawDegrees: motion.relativeYawDegrees,
-            systemName: Self.cleanName(peripheral.name),
-            model: DeviceCatalog.bundled.model(miBeaconPayload: miBeacon, broadcastName: localName,
-                manufacturerData: advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data))
+            systemName: systemName,
+            model: DeviceCatalog.bundled.model(miBeaconPayload: serviceData["FE95"], broadcastName: localName,
+                manufacturerData: advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
+                switchBotPayload: switchBotData,
+                hasBTHome: serviceData["FCD2"]?.first.map { $0 >> 5 == 2 } == true,
+                systemName: systemName))
         continuation.yield(sample)
         let source = registry.ingest(sample, filter: TuningConfig.filter(userSettings.filterStrength))
         registry.trim(to: profile.maxSources)

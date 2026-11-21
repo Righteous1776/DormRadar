@@ -78,15 +78,19 @@ jobs:
             build
 
       - name: Package unsigned IPA
+        id: ipa
         run: |
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -R "$RUNNER_TEMP/device-build/Build/Products/Release-iphoneos/DormRadar.app" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP"
           zip -qry DormRadar-unsigned.ipa Payload
+          version=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Payload/DormRadar.app/Info.plist)
+          build=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' Payload/DormRadar.app/Info.plist)
+          echo "artifact_name=DormRadar-V${version}-Build${build}-unsigned" >> "$GITHUB_OUTPUT"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: DormRadar-V1.3-unsigned
+          name: ${{ steps.ipa.outputs.artifact_name }}
           path: ${{ runner.temp }}/DormRadar-unsigned.ipa
           retention-days: 14

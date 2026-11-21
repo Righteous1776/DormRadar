@@ -20,3 +20,27 @@ Apple/Beats headset broadcast model codes
 Model code facts cross-referenced against the Theengs Decoder's documented public advertisement mapping.
 https://github.com/theengs/decoder/blob/90546887b48dda186b376885d685e718125efa16/src/devices/APPLEAIRPODS_json.h
 https://support.apple.com/en-us/109525
+
+AdditionalModelCodes.json
+Generate with scripts/update_model_catalog.py using the four inputs below.
+
+Android hardware model strings
+Google Play's public Supported Devices list via bsthen/device-models at b9f7f968b55733abb182784c33798a335ecc2cce.
+https://storage.googleapis.com/play_public/supported_devices.csv
+https://github.com/bsthen/device-models/blob/b9f7f968b55733abb182784c33798a335ecc2cce/devices.json
+See Android-Device-Models-License.txt. Retains known brand/code patterns only, discards generic labels and conflicting normalized codes, and does exact whole-name matching. Catalog coverage does not imply that devices broadcast their code.
+
+Apple hardware identifiers
+DeviceKit at fab82bd988405367c915143e293479f481e93ba0.
+https://github.com/devicekit/DeviceKit/blob/fab82bd988405367c915143e293479f481e93ba0/Source/Device.generated.swift
+See DeviceKit-License.txt. Maps exact broadcast or iOS names that are Apple hardware identifiers.
+
+SwitchBot service data
+sblibs/pySwitchbot at 28daaddc24b62e5f98b1be54a62d059c760d5191.
+https://github.com/sblibs/pySwitchbot/blob/28daaddc24b62e5f98b1be54a62d059c760d5191/switchbot/adv_parser.py
+See PySwitchbot-License.txt. Only consults SwitchBot service data (FD3D and legacy 0D00). Reads public product codes without decoding sensor data or tracking a private identifier.
+
+Shelly BTHome names
+Bluetooth-Devices/bthome-ble at d43828fa056ade9a9ab8fa2872aaf5b8b15224f9.
+https://github.com/Bluetooth-Devices/bthome-ble/blob/d43828fa056ade9a9ab8fa2872aaf5b8b15224f9/src/bthome_ble/parser.py
+See BTHome-BLE-License.txt. Requires the BTHome v2 header and an exact Shelly model string.
